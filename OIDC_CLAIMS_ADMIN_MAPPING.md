@@ -348,6 +348,149 @@ that to "Your account is not authorised to access MediaManager.
 Contact your administrator." No new API contract — just a query
 param and a string in the existing error banner.
 
+## Example Configurations
+
+### Minimal — mapping disabled (current behaviour preserved)
+
+```toml
+[auth]
+token_secret = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6"
+session_lifetime = 604800
+admin_emails = ["ops@example.com"]
+
+[auth.openid_connect]
+enabled = true
+client_id = "mediamanager"
+client_secret = "..."
+configuration_endpoint = "https://auth.example.com/.well-known/openid-configuration"
+name = "Authentik"
+
+# claim_mapping omitted -> enabled = false, every OIDC user admitted as today
+```
+
+### Authentik — full three-tier (admin / user / denied)
+
+Recommended setup. Only IdP-group members reach MediaManager;
+everyone else is rejected at the OAuth callback.
+
+```toml
+[auth]
+token_secret = "..."
+admin_emails = ["ops@example.com"]   # break-glass — always admin even if IdP forgets
+
+[auth.openid_connect]
+enabled = true
+client_id = "mediamanager"
+client_secret = "..."
+configuration_endpoint = "https://auth.example.com/application/o/mediamanager/.well-known/openid-configuration"
+name = "Authentik"
+additional_scopes = ["groups"]       # Authentik needs this for the claim to appear
+
+[auth.openid_connect.claim_mapping]
+enabled = true
+claim = "groups"
+admin_values = ["mediamanager-admins"]
+user_values  = ["mediamanager-users"]
+deny_unmatched = true                # anyone in neither group: is_active = false
+revoke_when_missing = true           # re-evaluate on every login
+```
+
+Result per login:
+
+| User's `groups` claim | Outcome |
+|---|---|
+| contains `mediamanager-admins` | admin (`is_superuser=true`, `is_active=true`) |
+| contains `mediamanager-users` only | regular user (`is_superuser=false`, `is_active=true`) |
+| contains neither | denied (`is_active=false`, 4xx at callback) |
+| email is `ops@example.com` | admin regardless of claims |
+
+### Keycloak — admin tier only, soft-deny
+
+Promote a Keycloak `realm-admin` role to MediaManager admin.
+Don't gate regular-user access by claim — anyone the IdP
+authenticated is fine. Soft-deny: missing claim leaves prior
+state untouched (handy when group membership can be transient).
+
+```toml
+[auth.openid_connect]
+enabled = true
+client_id = "mediamanager"
+client_secret = "..."
+configuration_endpoint = "https://keycloak.example.com/realms/main/.well-known/openid-configuration"
+name = "Keycloak"
+additional_scopes = []   # roles already in profile scope on this realm
+
+[auth.openid_connect.claim_mapping]
+enabled = true
+claim = "roles"
+admin_values = ["mediamanager-admin", "platform-superuser"]
+user_values = []                # no user-list -> all authenticated IdP users admitted
+deny_unmatched = false          # missing claim doesn't lock them out
+revoke_when_missing = false     # don't downgrade if the claim is absent in a token
+```
+
+### Azure AD / Entra — conservative deny, group object IDs
+
+Azure ships group object IDs (UUIDs) rather than names, and
+sometimes omits `groups` entirely if the user is in too many
+groups (Azure falls back to a Graph API call). Keep
+`deny_unmatched = false` to avoid accidental lockouts when the
+claim is missing for non-policy reasons.
+
+```toml
+[auth.openid_connect]
+enabled = true
+client_id = "00000000-0000-0000-0000-000000000000"
+client_secret = "..."
+configuration_endpoint = "https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration"
+name = "Microsoft"
+additional_scopes = []
+
+[auth.openid_connect.claim_mapping]
+enabled = true
+claim = "groups"
+admin_values = ["b1f3aaaa-0000-0000-0000-aaaaaaaaaaaa"]   # admins group object ID
+user_values  = ["c2f4bbbb-0000-0000-0000-bbbbbbbbbbbb"]   # users group object ID
+deny_unmatched = false        # missing claim != deny; only explicit non-membership denies
+revoke_when_missing = false   # missing claim leaves existing tier untouched
+```
+
+### Scopes only — no claim mapping
+
+Want a refresh token but no claim-based gating? Perfectly valid
+— only the top-level `additional_scopes` field is needed.
+
+```toml
+[auth.openid_connect]
+enabled = true
+client_id = "mediamanager"
+client_secret = "..."
+configuration_endpoint = "https://auth.example.com/.well-known/openid-configuration"
+name = "Authentik"
+additional_scopes = ["offline_access", "groups"]
+# claim_mapping omitted -> all OIDC users admitted, no role promotion
+```
+
+### Env-var equivalent
+
+Same Authentik three-tier setup via env vars (prefix
+`MEDIAMANAGER_`, nested delimiter `__`) for docker-compose / k8s:
+
+```bash
+MEDIAMANAGER_AUTH__OPENID_CONNECT__ENABLED=true
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLIENT_ID=mediamanager
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLIENT_SECRET=...
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CONFIGURATION_ENDPOINT=https://auth.example.com/.well-known/openid-configuration
+MEDIAMANAGER_AUTH__OPENID_CONNECT__NAME=Authentik
+MEDIAMANAGER_AUTH__OPENID_CONNECT__ADDITIONAL_SCOPES=["groups"]
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__ENABLED=true
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__CLAIM=groups
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__ADMIN_VALUES=["mediamanager-admins"]
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__USER_VALUES=["mediamanager-users"]
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__DENY_UNMATCHED=true
+MEDIAMANAGER_AUTH__OPENID_CONNECT__CLAIM_MAPPING__REVOKE_WHEN_MISSING=true
+```
+
 ## Implementation Checklist
 
 1. `media_manager/auth/config.py`
