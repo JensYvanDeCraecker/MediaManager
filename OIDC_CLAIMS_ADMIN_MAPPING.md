@@ -38,9 +38,12 @@ service every time admin membership changes.
    registration. Subsequent logins where group membership changes
    would never re-evaluate admin status.
 3. **No config surface.** `OpenIdConfig` has no fields for
-   "which claim to read" or "which values mean admin," and no extra
-   scopes are requested (a provider may not include `groups` in the
-   token unless asked).
+   "which claim to read" or "which values mean admin." It also
+   hard-codes the requested scopes to `["openid", "email",
+   "profile"]` at `media_manager/auth/users.py:36`, so operators
+   can't ask the IdP for `groups`, `roles`, or any provider-specific
+   scope — a precondition for the claim ever appearing in the
+   userinfo payload.
 4. **Local accounts must keep working.** Whatever we add must
    coexist with the email/password flow and the
    `admin_emails`/`create_default_admin_user` bootstrap so an
@@ -50,40 +53,101 @@ service every time admin membership changes.
 
 ### 1. Config surface (`media_manager/auth/config.py`)
 
-Extend `OpenIdConfig` with a nested `admin_mapping` block:
+Two independent additions to `OpenIdConfig`. They're orthogonal:
+admin-mapping needs extra scopes in practice, but operators may
+want to request additional scopes for other reasons (future
+features, audit, or because their proxy/IdP requires them), so
+scope configuration is **not** nested inside `admin_mapping`.
 
 ```python
 class OpenIdAdminMapping(BaseSettings):
     enabled: bool = False
     claim: str = "groups"          # ID-token / userinfo claim to inspect
     admin_values: list[str] = []   # values that grant is_superuser
-    additional_scopes: list[str] = []  # appended to base_scopes
     revoke_when_missing: bool = True   # demote on login if claim no longer matches
+
+
+class OpenIdConfig(BaseSettings):
+    client_id: str = ""
+    client_secret: str = ""
+    configuration_endpoint: str = ""
+    enabled: bool = False
+    name: str = "OAuth2"
+    additional_scopes: list[str] = []           # appended to ["openid", "email", "profile"]
+    admin_mapping: OpenIdAdminMapping = OpenIdAdminMapping()
 ```
 
-Add `admin_mapping: OpenIdAdminMapping = OpenIdAdminMapping()` to
-`OpenIdConfig`. Defaults keep current behaviour (feature off, no
-extra scopes, no revoke). Document under
+Defaults keep current behaviour: feature off, no extra scopes, no
+revoke. Document both fields under
 `docs/configuration/authentication.md` alongside the existing
 `[auth.openid_connect]` block.
 
-Example:
+#### Scopes — wiring
+
+At `media_manager/auth/users.py:36` today:
+
+```python
+base_scopes=["openid", "email", "profile"],
+```
+
+becomes:
+
+```python
+base_scopes=["openid", "email", "profile", *config.openid_connect.additional_scopes],
+```
+
+Notes:
+- **De-duplicate** the resulting list (preserve order) so an
+  operator who naively re-adds `"openid"` doesn't send it twice.
+- **Don't silently strip `openid`.** If someone tries to remove it,
+  fastapi-users / httpx-oauth will fail loudly at the next login;
+  that's clearer than the request succeeding with a non-OIDC token.
+  No special-case code needed.
+- The httpx-oauth `OpenID` client passes `base_scopes` straight to
+  the authorise URL, so any string the provider understands works
+  (`groups`, `roles`, `offline_access`, `openid:profile:read`, …).
+  This is a thin pass-through, not a curated allow-list.
+
+#### Why a top-level field, not under `admin_mapping`
+
+- Admin-mapping is one consumer of extra scopes; future features
+  (e.g. surfacing a user's groups in the UI, or audit logging the
+  IdP's `acr` value) would re-need the same plumbing.
+- Some IdPs require scopes that have nothing to do with claims at
+  all — e.g. `offline_access` to get a refresh token. Coupling
+  scope config to admin-mapping would force operators to enable a
+  feature they don't want just to request the scope.
+- It mirrors `httpx-oauth`'s own model: scopes are a property of
+  the OAuth client, claim handling is a property of the
+  application.
+
+Example with both:
 
 ```toml
+[auth.openid_connect]
+enabled = true
+client_id = "mediamanager"
+client_secret = "..."
+configuration_endpoint = "https://auth.example.com/.well-known/openid-configuration"
+name = "Authentik"
+additional_scopes = ["groups"]   # Authentik / Azure AD need this; Keycloak often doesn't
+
 [auth.openid_connect.admin_mapping]
 enabled = true
 claim = "groups"
 admin_values = ["mediamanager-admins", "platform-admins"]
-additional_scopes = ["groups"]   # Authentik / Keycloak need this
 revoke_when_missing = true
 ```
 
-The `additional_scopes` list is appended to
-`base_scopes=["openid", "email", "profile"]` at
-`media_manager/auth/users.py:36` so providers actually emit the
-claim. Some providers (Keycloak) ship groups in `openid`/`profile`;
-others (Authentik, Azure AD) require an explicit scope, hence the
-config knob.
+Example with extra scopes but no admin-mapping (perfectly valid):
+
+```toml
+[auth.openid_connect]
+enabled = true
+# ...
+additional_scopes = ["offline_access", "groups"]
+# admin_mapping omitted -> disabled by default
+```
 
 ### 2. Reading claims from the OIDC flow
 
@@ -190,10 +254,13 @@ the JWT claims, the cookie needs reissuing on change.
 
 ## Implementation Checklist
 
-1. `media_manager/auth/config.py` — add `OpenIdAdminMapping` and
-   wire it into `OpenIdConfig`.
+1. `media_manager/auth/config.py`
+   - Add `additional_scopes: list[str] = []` on `OpenIdConfig`.
+   - Add `OpenIdAdminMapping` and wire it into `OpenIdConfig` as
+     `admin_mapping`.
 2. `media_manager/auth/users.py`
-   - Append `admin_mapping.additional_scopes` to `base_scopes`.
+   - Append `config.openid_connect.additional_scopes` to
+     `base_scopes` (de-duplicated, order preserved).
    - Add `ClaimAwareOpenID` subclass with a `ContextVar` for the
      latest userinfo payload.
    - Add `apply_oidc_admin_mapping()` helper.
